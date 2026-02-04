@@ -184,13 +184,47 @@ const AGENT_RUNTIME = {
       name: 'Ollama (Local)',
       type: 'local',
       defaultUrl: 'http://localhost:11434',
-      defaultModel: 'llama3',
+      defaultModel: 'first installed model (auto)',
+      normalizeModelName: (name = '') => name.trim().toLowerCase(),
+      fetchLocalModels: async (baseUrl, signal) => {
+        const res = await fetch(`${baseUrl}/api/tags`, { signal });
+        if (!res.ok) throw new Error('Unreachable');
+        const data = await res.json();
+        return data.models || [];
+      },
+      resolveModel: async (config, signal) => {
+        const models = await AGENT_RUNTIME.adapters.ollama.fetchLocalModels(config.baseUrl, signal);
+        const requested = config.model?.trim();
+
+        if (!models.length) {
+          throw new Error("No local Ollama models found. Pull one first (example: 'ollama pull phi3').");
+        }
+
+        if (!requested) {
+          return models[0].name;
+        }
+
+        const requestedNorm = AGENT_RUNTIME.adapters.ollama.normalizeModelName(requested);
+        const matched = models.find((m) => {
+          const name = AGENT_RUNTIME.adapters.ollama.normalizeModelName(m.name || '');
+          const baseName = name.split(':')[0];
+          return name === requestedNorm || name.startsWith(`${requestedNorm}:`) || baseName === requestedNorm;
+        });
+
+        if (!matched) {
+          const available = models.map((m) => m.name).join(', ');
+          throw new Error(`Model '${requested}' not found locally. Available: ${available}`);
+        }
+
+        return matched.name;
+      },
       chat: async (config, messages, signal) => {
+        const modelName = await AGENT_RUNTIME.adapters.ollama.resolveModel(config, signal);
         const res = await fetch(`${config.baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: config.model || 'llama3',
+            model: modelName,
             messages,
             stream: false
           }),
@@ -202,18 +236,13 @@ const AGENT_RUNTIME = {
       },
       check: async (config) => {
         try {
-          const res = await fetch(`${config.baseUrl}/api/tags`);
-          if (!res.ok) throw new Error('Unreachable');
-
-          if (config.model) {
-            const data = await res.json();
-            const exists = data.models?.some((m) => m.name.includes(config.model));
-            if (!exists) throw new Error(`Model '${config.model}' not found locally`);
-          }
+          await AGENT_RUNTIME.adapters.ollama.resolveModel(config);
           return true;
         } catch (e) {
           throw new Error(
-            e.message.includes('Model') ? e.message : 'Ensure Ollama is running with OLLAMA_ORIGINS="*"'
+            e.message.includes('Model') || e.message.includes('No local Ollama models')
+              ? e.message
+              : 'Ensure Ollama is running with OLLAMA_ORIGINS="*"'
           );
         }
       }
