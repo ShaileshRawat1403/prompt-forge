@@ -220,13 +220,19 @@ const AGENT_RUNTIME = {
       },
       chat: async (config, messages, signal) => {
         const modelName = await AGENT_RUNTIME.adapters.ollama.resolveModel(config, signal);
+        // Conservative defaults reduce OOM/"signal: killed" failures on local machines.
+        const runtimeOptions = {
+          num_ctx: 1024,
+          num_predict: 256
+        };
         const res = await fetch(`${config.baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: modelName,
             messages,
-            stream: false
+            stream: false,
+            options: runtimeOptions
           }),
           signal
         });
@@ -960,6 +966,7 @@ ${output.agentsMd}
 
       agentRunTimer.current = setTimeout(async () => {
         if (signal.aborted) return;
+        let hadError = false;
         try {
           const response = await activeAdapter.chat(config, messages, signal);
           addLog(`Response Received: ${response.length} chars`, 'success', 0);
@@ -968,6 +975,7 @@ ${output.agentsMd}
           if (err.name === 'AbortError') {
             addLog('Request Aborted by user.', 'warning', 0);
           } else {
+            hadError = true;
             addLog(`Execution Failed: ${err.message}`, 'error', 0);
             if (providerId === 'ollama') {
               const msg = (err.message || '').toLowerCase();
@@ -982,7 +990,7 @@ ${output.agentsMd}
           }
         } finally {
           if (!signal.aborted) {
-            addLog('Process Terminated.', 'info', 500);
+            addLog(hadError ? 'Run Failed.' : 'Run Completed.', hadError ? 'error' : 'success', 500);
             agentRunTimer.current = setTimeout(() => setAgentRunning(false), 4000);
           }
         }
