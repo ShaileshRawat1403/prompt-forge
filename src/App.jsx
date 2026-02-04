@@ -113,7 +113,15 @@ const AGENT_RUNTIME = {
           throw new Error(err.error?.message || `OpenAI Error: ${res.status}`);
         }
         const data = await res.json();
-        return data.choices[0].message.content;
+        return {
+          text: data.choices[0].message.content,
+          meta: {
+            model: data.model,
+            promptTokens: data.usage?.prompt_tokens || 0,
+            completionTokens: data.usage?.completion_tokens || 0,
+            totalTokens: data.usage?.total_tokens || 0
+          }
+        };
       },
       check: async (config) => {
         if (!config.apiKey) throw new Error('Missing API Key');
@@ -164,7 +172,10 @@ const AGENT_RUNTIME = {
           throw new Error(err.error?.message || `Gemini Error: ${res.status}`);
         }
         const data = await res.json();
-        return data.candidates[0].content.parts[0].text;
+        return {
+          text: data.candidates[0].content.parts[0].text,
+          meta: { model: modelId }
+        };
       },
       check: async (config) => {
         if (!config.apiKey) throw new Error('Missing API Key');
@@ -247,7 +258,17 @@ const AGENT_RUNTIME = {
           throw new Error(message);
         }
         const data = await res.json();
-        return data.message.content;
+        return {
+          text: data.message?.content || '',
+          meta: {
+            model: data.model,
+            promptTokens: data.prompt_eval_count || 0,
+            completionTokens: data.eval_count || 0,
+            evalDurationNs: data.eval_duration || 0,
+            loadDurationNs: data.load_duration || 0,
+            totalDurationNs: data.total_duration || 0
+          }
+        };
       },
       check: async (config) => {
         try {
@@ -646,9 +667,22 @@ function PromptForgeApp() {
 
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentLogs, setAgentLogs] = useState([]);
+  const [runtimeStats, setRuntimeStats] = useState({
+    provider: '',
+    model: '-',
+    tokenPerSec: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    latencyMs: 0,
+    cpuLoad: 0,
+    memoryMb: 0,
+    gpuMode: '-',
+    gpuVramMb: 0
+  });
 
   const toastTimer = useRef(null);
   const agentRunTimer = useRef(null);
+  const statsTimerRef = useRef(null);
   const abortControllerRef = useRef(null);
 
   useEffect(() => {
@@ -683,6 +717,7 @@ function PromptForgeApp() {
   useEffect(() => {
     return () => {
       if (agentRunTimer.current) clearTimeout(agentRunTimer.current);
+      if (statsTimerRef.current) clearInterval(statsTimerRef.current);
     };
   }, []);
 
@@ -925,6 +960,9 @@ ${output.agentsMd}
     if (agentRunTimer.current) {
       clearTimeout(agentRunTimer.current);
     }
+    if (statsTimerRef.current) {
+      clearInterval(statsTimerRef.current);
+    }
     setAgentLogs((prev) => [...prev, { text: '> STOPPED: User cancelled operation.', type: 'error' }]);
     setTimeout(() => setAgentRunning(false), 1000);
   };
@@ -934,9 +972,13 @@ ${output.agentsMd}
     setAgentLogs([]);
 
     if (agentRunTimer.current) clearTimeout(agentRunTimer.current);
+    if (statsTimerRef.current) clearInterval(statsTimerRef.current);
 
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
+    const requestStartedAt = performance.now();
+    let lastStatsTick = requestStartedAt;
+    let lastPsPoll = 0;
 
     const addLog = (text, type = 'info', delay = 0) => {
       setAgentLogs((prev) => [...prev, { text, type, delay }]);
@@ -949,6 +991,55 @@ ${output.agentsMd}
       ...settings.providers[providerId],
       apiKey: secrets[providerId]
     };
+
+    setRuntimeStats((prev) => ({
+      ...prev,
+      provider: activeAdapter.name,
+      model: config.model?.trim() || 'auto',
+      tokenPerSec: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      latencyMs: 0,
+      cpuLoad: 0,
+      gpuMode: '-',
+      gpuVramMb: 0
+    }));
+
+    statsTimerRef.current = setInterval(async () => {
+      const now = performance.now();
+      const deltaMs = now - lastStatsTick;
+      lastStatsTick = now;
+      const drift = Math.max(0, deltaMs - 1000);
+      const uiLoad = Math.min(100, Math.round((drift / 16) * 8));
+      const usedHeap =
+        performance?.memory?.usedJSHeapSize ? Math.round(performance.memory.usedJSHeapSize / 1024 / 1024) : 0;
+
+      setRuntimeStats((prev) => ({
+        ...prev,
+        latencyMs: Math.round(now - requestStartedAt),
+        cpuLoad: uiLoad,
+        memoryMb: usedHeap
+      }));
+
+      if (providerId === 'ollama' && now - lastPsPoll > 2000) {
+        lastPsPoll = now;
+        try {
+          const psRes = await fetch(`${config.baseUrl}/api/ps`, { signal });
+          if (psRes.ok) {
+            const psData = await psRes.json();
+            const runningModel = psData.models?.[0];
+            setRuntimeStats((prev) => ({
+              ...prev,
+              model: runningModel?.name || prev.model,
+              gpuVramMb: runningModel?.size_vram ? Math.round(runningModel.size_vram / 1024 / 1024) : 0,
+              gpuMode: runningModel?.size_vram > 0 ? 'GPU' : 'CPU'
+            }));
+          }
+        } catch {
+          // Metrics polling is best-effort; do not break the run.
+        }
+      }
+    }, 1000);
 
     addLog(`Initializing Runtime: ${activeAdapter.name}...`, 'info', 0);
 
@@ -969,8 +1060,23 @@ ${output.agentsMd}
         let hadError = false;
         try {
           const response = await activeAdapter.chat(config, messages, signal);
-          addLog(`Response Received: ${response.length} chars`, 'success', 0);
-          addLog(`\n--- OUTPUT ---\n${response.slice(0, 200)}...`, 'input', 200);
+          const text = typeof response === 'string' ? response : response?.text || '';
+          const meta = typeof response === 'object' ? response?.meta || {} : {};
+          const tokenPerSec =
+            meta.evalDurationNs > 0 && meta.completionTokens > 0
+              ? Number((meta.completionTokens / (meta.evalDurationNs / 1e9)).toFixed(2))
+              : 0;
+
+          setRuntimeStats((prev) => ({
+            ...prev,
+            model: meta.model || prev.model,
+            promptTokens: meta.promptTokens || 0,
+            completionTokens: meta.completionTokens || 0,
+            tokenPerSec
+          }));
+
+          addLog(`Response Received: ${text.length} chars`, 'success', 0);
+          addLog(`\n--- OUTPUT ---\n${text.slice(0, 200)}...`, 'input', 200);
         } catch (err) {
           if (err.name === 'AbortError') {
             addLog('Request Aborted by user.', 'warning', 0);
@@ -990,15 +1096,17 @@ ${output.agentsMd}
           }
         } finally {
           if (!signal.aborted) {
+            if (statsTimerRef.current) clearInterval(statsTimerRef.current);
             addLog(hadError ? 'Run Failed.' : 'Run Completed.', hadError ? 'error' : 'success', 500);
-            agentRunTimer.current = setTimeout(() => setAgentRunning(false), 4000);
+            agentRunTimer.current = setTimeout(() => setAgentRunning(false), 15000);
           }
         }
       }, 800);
     } catch (e) {
+      if (statsTimerRef.current) clearInterval(statsTimerRef.current);
       addLog(`Connection Failed: ${e.message}`, 'error', 200);
       addLog('Please check Settings > Model Registry', 'warning', 300);
-      agentRunTimer.current = setTimeout(() => setAgentRunning(false), 4000);
+      agentRunTimer.current = setTimeout(() => setAgentRunning(false), 10000);
     }
   };
 
@@ -1475,21 +1583,62 @@ ${output.agentsMd}
             <h2 className="text-2xl font-black font-mono mb-6">EXPORT &amp; RUN</h2>
 
             <div className="flex-1 bg-stone-50 rounded-xl border-2 border-stone-200 p-4 mb-6 overflow-y-auto relative">
-              {agentRunning ? (
+              {agentRunning || agentLogs.length > 0 ? (
                 <div className="absolute inset-0 bg-stone-900 rounded-xl p-6 font-mono text-xs overflow-y-auto z-20">
                   <div className="flex justify-between items-center mb-4 border-b border-stone-700 pb-2">
                     <span className="text-green-400 font-bold flex items-center gap-2">
                       <Terminal size={14} /> AGENT TERMINAL
                     </span>
-                    <button onClick={handleStopAgent} className="text-red-400 hover:text-red-300">
-                      <StopCircle size={16} />
-                    </button>
+                    <div className="flex items-center gap-3">
+                      {agentRunning && (
+                        <button onClick={handleStopAgent} className="text-red-400 hover:text-red-300">
+                          <StopCircle size={16} />
+                        </button>
+                      )}
+                      {!agentRunning && (
+                        <button
+                          onClick={() => setAgentLogs([])}
+                          className="text-stone-400 hover:text-stone-200 text-[10px] uppercase"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+                    <div className="rounded bg-stone-800 px-2 py-1">
+                      <div className="text-[9px] text-stone-400 uppercase">Token/s</div>
+                      <div className="text-green-300 font-bold">{runtimeStats.tokenPerSec || '-'}</div>
+                    </div>
+                    <div className="rounded bg-stone-800 px-2 py-1">
+                      <div className="text-[9px] text-stone-400 uppercase">CPU (UI)</div>
+                      <div className="text-cyan-300 font-bold">{runtimeStats.cpuLoad}%</div>
+                    </div>
+                    <div className="rounded bg-stone-800 px-2 py-1">
+                      <div className="text-[9px] text-stone-400 uppercase">Memory</div>
+                      <div className="text-amber-300 font-bold">
+                        {runtimeStats.memoryMb > 0 ? `${runtimeStats.memoryMb} MB` : '-'}
+                      </div>
+                    </div>
+                    <div className="rounded bg-stone-800 px-2 py-1">
+                      <div className="text-[9px] text-stone-400 uppercase">GPU</div>
+                      <div className="text-fuchsia-300 font-bold">
+                        {runtimeStats.gpuMode}
+                        {runtimeStats.gpuVramMb > 0 ? ` (${runtimeStats.gpuVramMb} MB)` : ''}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-stone-500 mb-3">
+                    Model: <span className="text-stone-300">{runtimeStats.model}</span> | Prompt tokens:{' '}
+                    <span className="text-stone-300">{runtimeStats.promptTokens}</span> | Completion tokens:{' '}
+                    <span className="text-stone-300">{runtimeStats.completionTokens}</span> | Latency:{' '}
+                    <span className="text-stone-300">{runtimeStats.latencyMs} ms</span>
                   </div>
                   <div className="space-y-2">
                     {agentLogs.map((log, i) => (
                       <TerminalLine key={i} text={log.text} type={log.type} delay={log.delay} />
                     ))}
-                    <div className="animate-pulse text-green-500 mt-2">_</div>
+                    {agentRunning && <div className="animate-pulse text-green-500 mt-2">_</div>}
                   </div>
                 </div>
               ) : (
