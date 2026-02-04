@@ -230,7 +230,16 @@ const AGENT_RUNTIME = {
           }),
           signal
         });
-        if (!res.ok) throw new Error('Ollama connection failed. Check CORS settings.');
+        if (!res.ok) {
+          let message = `Ollama Error: ${res.status}`;
+          try {
+            const err = await res.json();
+            if (err?.error) message = err.error;
+          } catch {
+            // keep fallback message if response is not JSON
+          }
+          throw new Error(message);
+        }
         const data = await res.json();
         return data.message.content;
       },
@@ -961,7 +970,14 @@ ${output.agentsMd}
           } else {
             addLog(`Execution Failed: ${err.message}`, 'error', 0);
             if (providerId === 'ollama') {
-              addLog("Tip: Run 'ollama serve' and ensure CORS is allowed.", 'info', 100);
+              const msg = (err.message || '').toLowerCase();
+              if (msg.includes('model') && msg.includes('not found')) {
+                addLog("Tip: Choose an installed tag (for example 'phi3:mini-128k').", 'info', 100);
+              } else if (msg.includes('signal: killed') || msg.includes('runner process has terminated')) {
+                addLog('Tip: Model runner was killed (likely memory/resource pressure). Try a smaller model or close heavy apps.', 'info', 100);
+              } else if (msg.includes('failed to fetch') || msg.includes('networkerror')) {
+                addLog("Tip: Check Ollama URL and CORS (start with OLLAMA_ORIGINS='*' ollama serve).", 'info', 100);
+              }
             }
           }
         } finally {
